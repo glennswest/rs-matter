@@ -20,5 +20,6 @@
 pub mod avahi;
 pub mod bluez;
 pub mod nm;
+pub mod openthread;
 pub mod resolve;
 pub mod wpa_supp;
