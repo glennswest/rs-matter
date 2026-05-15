@@ -23,21 +23,12 @@
 //! - **Thread 1.3 Spec §8** — Operational Dataset TLV encoding (the hex
 //!   blob `ot-ctl dataset active -x` emits).
 //!
-//! ## API shape consulted
+//! ## Concrete provider
 //!
-//! `python-matter-server` delegates Thread credential fetch to Home
-//! Assistant's Thread integration (which talks to OTBR over D-Bus or
-//! mdns to discover border routers and over OTBR REST to fetch dataset).
-//! We mirror the trait shape — caller provides a [`NetworkCredentialProvider`]
-//! and the controller asks it for credentials when a device's Network
-//! Commissioning cluster reports needing them.
-//!
-//! ## Implementations
-//!
-//! Initial concrete implementation: [`OtbrLocalProvider`] — talks to an
-//! `otbr-agent` running on the same host via the `ot-ctl` IPC socket
-//! (`/run/openthread-wpan0.sock`) or via D-Bus (`org.openthread.BorderRouter`).
-//! That's how `zman` will plug in, since it co-runs with OTBR on the Pi.
+//! [`OtbrLocalProvider`] (feature `zbus`) talks to a co-resident `otbr-agent`
+//! over D-Bus (`io.openthread.BorderRouter.wpan0`) and fetches the live
+//! `ActiveDatasetTlvs` property. This is the path zman uses, since zman and
+//! OTBR co-run on the Pi.
 
 use super::ControllerError;
 
@@ -75,22 +66,86 @@ pub trait NetworkCredentialProvider {
     ) -> impl core::future::Future<Output = Result<WifiCredentials, ControllerError>>;
 }
 
-/// Placeholder implementation that talks to a local `otbr-agent`.
+/// Provider that talks to a local `otbr-agent` over D-Bus.
 ///
-/// Concrete plumbing TBD — will use either:
-/// 1. D-Bus to `org.openthread.BorderRouter.wpan0` (cleanest on systemd hosts), or
-/// 2. The unix-domain `ot-ctl` socket (simpler, no D-Bus dep), or
-/// 3. The OTBR REST API (network-reachable, but adds an HTTP dep).
+/// Concrete implementation of [`NetworkCredentialProvider::thread_dataset`].
+/// Wi-Fi credentials are not provided by OTBR — callers wanting Wi-Fi need
+/// to layer their own provider on top.
+///
+/// ## Connection
+///
+/// Connects on construction to the system D-Bus and to the
+/// `io.openthread.BorderRouter.<ifname>` service. The interface name
+/// (typically `wpan0`) is configurable so multiple OTBR instances can
+/// coexist.
+///
+/// ## Errors
+///
+/// All D-Bus errors fold into [`ControllerError::NetworkCommissioningFailed`].
+/// Callers can inspect logs for the underlying cause via the `tracing` /
+/// `log` features.
+#[cfg(feature = "zbus")]
 pub struct OtbrLocalProvider {
-    // TODO: handle to the chosen IPC channel
+    proxy: crate::utils::zbus_proxies::openthread::border_router::BorderRouterProxy<'static>,
 }
 
+#[cfg(feature = "zbus")]
+impl OtbrLocalProvider {
+    /// Connect to the system D-Bus and bind a proxy for the OTBR service
+    /// named `io.openthread.BorderRouter.<ifname>`.
+    ///
+    /// Default `ifname` is `"wpan0"` — see [`OtbrLocalProvider::for_interface`]
+    /// to override.
+    pub async fn new() -> Result<Self, ControllerError> {
+        Self::for_interface("wpan0").await
+    }
+
+    /// Connect to a specific OTBR Thread interface (multi-radio hosts).
+    pub async fn for_interface(ifname: &str) -> Result<Self, ControllerError> {
+        let conn = zbus::Connection::system()
+            .await
+            .map_err(|_| ControllerError::NetworkCommissioningFailed)?;
+        let service = format!("io.openthread.BorderRouter.{}", ifname);
+        let path = format!("/io/openthread/BorderRouter/{}", ifname);
+        let proxy =
+            crate::utils::zbus_proxies::openthread::border_router::BorderRouterProxy::builder(
+                &conn,
+            )
+            .destination(service)
+            .map_err(|_| ControllerError::NetworkCommissioningFailed)?
+            .path(path)
+            .map_err(|_| ControllerError::NetworkCommissioningFailed)?
+            .build()
+            .await
+            .map_err(|_| ControllerError::NetworkCommissioningFailed)?;
+        Ok(Self { proxy })
+    }
+}
+
+#[cfg(feature = "zbus")]
 impl NetworkCredentialProvider for OtbrLocalProvider {
     async fn thread_dataset(&self) -> Result<ThreadDataset, ControllerError> {
-        Err(ControllerError::NetworkCommissioningFailed)
+        let bytes = self
+            .proxy
+            .active_dataset_tlvs()
+            .await
+            .map_err(|_| ControllerError::NetworkCommissioningFailed)?;
+        if bytes.is_empty() {
+            // OTBR returns an empty array when the network is disabled or
+            // detached — no useful dataset to hand to an accessory.
+            return Err(ControllerError::NetworkCommissioningFailed);
+        }
+        let mut tlv = heapless::Vec::<u8, 256>::new();
+        tlv.extend_from_slice(&bytes)
+            .map_err(|_| ControllerError::NetworkCommissioningFailed)?;
+        Ok(ThreadDataset { tlv })
     }
 
     async fn wifi_credentials(&self) -> Result<WifiCredentials, ControllerError> {
+        // OTBR doesn't supply Wi-Fi credentials. A future
+        // `WifiCredentialProvider` trait split would clarify this; for now,
+        // return an error and let callers stack a Wi-Fi-aware provider on
+        // top if their accessories need Wi-Fi.
         Err(ControllerError::NetworkCommissioningFailed)
     }
 }
