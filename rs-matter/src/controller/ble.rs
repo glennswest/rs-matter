@@ -41,7 +41,18 @@
 //! 3. Expose a [`BleSession`] handle that the commissioner uses as a
 //!    Matter-frame transport (analogous to a UDP session in operational mode).
 //!
-//! Nothing in this file is functional yet — types are scaffolding.
+//! ## Status
+//!
+//! - Scan + GATT-connect are functional on Linux behind feature `bluer` —
+//!   see [`bluer`] sub-module.
+//! - BTP framing (segmentation, handshake, MTU negotiation per spec §5.4.4)
+//!   is not yet implemented. The [`BleSession`] trait's `send`/`recv` are
+//!   present so callers can wire to a future BTP driver; the bluer impl
+//!   leaves the bodies returning [`ControllerError::BleUnavailable`] for
+//!   now.
+
+#[cfg(all(target_os = "linux", feature = "bluer"))]
+pub mod bluer;
 
 use super::ControllerError;
 
