@@ -67,6 +67,7 @@ pub mod commissioner;
 pub mod error;
 pub mod network;
 pub mod operational;
+pub mod setup_code;
 pub mod store;
 
 pub use error::ControllerError;
