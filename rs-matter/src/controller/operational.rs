@@ -79,6 +79,7 @@ use crate::error::Error;
 use crate::im::client::ImClient;
 use crate::im::types::{AttrId, ClusterId, CmdId, EndptId, NodeId};
 use crate::transport::exchange::Exchange;
+use crate::transport::network::mdns::MdnsResolver;
 use crate::transport::network::Address;
 use crate::Matter;
 
@@ -169,6 +170,47 @@ impl<'a, C: Crypto + 'a> OperationalClient<'a, C> {
     /// [`Self::establish_case`] with an [`OperationalLocator`].
     pub async fn open_exchange(&self, node_id: NodeId) -> Result<Exchange<'a>, Error> {
         Exchange::initiate(self.matter, self.fabric_idx.get(), node_id, true).await
+    }
+
+    /// Resolve a commissioned node's operational address via mDNS-SD
+    /// and return a ready-to-use [`OperationalLocator`].
+    ///
+    /// The caller supplies an [`MdnsResolver`] — the trait is host
+    /// agnostic so consumers can pick avahi (Linux), the builtin pure-
+    /// Rust resolver (any std host), Bonjour (macOS), etc.
+    ///
+    /// Together with [`Self::establish_case`] and [`Self::open_exchange`]
+    /// this closes the post-commission loop: given a fabric+node, get a
+    /// CASE-secured exchange ready for IM operations.
+    pub async fn resolve_node<R>(
+        &self,
+        resolver: &mut R,
+        compressed_fabric_id: u64,
+        node_id: NodeId,
+    ) -> Result<OperationalLocator, Error>
+    where
+        R: MdnsResolver,
+    {
+        let sock_addr = resolver.resolve(compressed_fabric_id, node_id).await?;
+        Ok(OperationalLocator {
+            node_id,
+            address: Address::Udp(sock_addr),
+        })
+    }
+
+    /// Convenience: resolve via mDNS and immediately drive CASE so the
+    /// next IM call against this node finds a cached session.
+    pub async fn resolve_and_establish_case<R>(
+        &self,
+        resolver: &mut R,
+        compressed_fabric_id: u64,
+        node_id: NodeId,
+    ) -> Result<(), Error>
+    where
+        R: MdnsResolver,
+    {
+        let locator = self.resolve_node(resolver, compressed_fabric_id, node_id).await?;
+        self.establish_case(locator).await
     }
 
     /// Drive a CASE handshake against `locator`, upgrading the local
