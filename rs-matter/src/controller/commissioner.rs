@@ -1060,6 +1060,160 @@ pub struct VendorInfo {
     pub model: heapless::String<64>,
 }
 
+/// Decoded NOCSRElements TLV (Matter §11.18.6.5.2).
+///
+/// The device returns this inside the CSRResponse — it's the signed
+/// payload the controller will hand to its FabricCredentials to mint a
+/// NOC. We must verify `csr_nonce` matches the nonce we sent in
+/// CSRRequest before trusting any of the contents.
+pub struct DecodedNocsr<'a> {
+    /// PKCS#10 CertificationRequest, DER-encoded. Hand straight to
+    /// `FabricCredentials::generate_device_credentials`.
+    pub csr_der: &'a [u8],
+    /// 32-byte nonce. Must equal the one passed to `csr_request`.
+    pub csr_nonce: &'a [u8],
+}
+
+/// Walk a NOCSRElements TLV blob and pull out the CSR DER + nonce.
+///
+/// Spec shape (1-indexed context tags):
+/// ```text
+/// struct NOCSRElements {
+///     octstr csr              = 1,
+///     octstr CSRNonce         = 2,
+///     octstr vendor_reserved1 = 3 [optional],
+///     octstr vendor_reserved2 = 4 [optional],
+///     octstr vendor_reserved3 = 5 [optional],
+/// }
+/// ```
+pub fn decode_nocsr_elements(blob: &[u8]) -> Result<DecodedNocsr<'_>, ControllerError> {
+    use crate::tlv::TLVElement;
+    let root = TLVElement::new(blob)
+        .structure()
+        .map_err(ControllerError::from)?;
+    let csr_der = root
+        .ctx(1)
+        .map_err(ControllerError::from)?
+        .str()
+        .map_err(ControllerError::from)?;
+    let csr_nonce = root
+        .ctx(2)
+        .map_err(ControllerError::from)?
+        .str()
+        .map_err(ControllerError::from)?;
+    Ok(DecodedNocsr { csr_der, csr_nonce })
+}
+
+/// End-to-end commissioning orchestration over an existing PASE session.
+///
+/// Pre-condition: caller has already driven `PaseInitiator::initiate` on
+/// `matter` against the device. From here:
+///
+///   1. `ArmFailSafe(fail_safe_secs, breadcrumb=0)` — opens the
+///      commissioning window the device gates the rest behind.
+///   2. `CSRRequest(random 32B nonce)` — receive NOCSRElements +
+///      attestation signature.
+///   3. Decode NOCSRElements, **verify nonce matches**.
+///   4. `FabricCredentials::generate_device_credentials(csr_der, &[])` —
+///      issue an operational NOC chain signed by our RCAC.
+///   5. `AddTrustedRootCertificate(rcac)` — install our root on the
+///      device so the chain validates locally.
+///   6. `AddNOC(noc, icac?, ipk, admin_subject, admin_vendor_id)` —
+///      device assigns us a FabricIndex.
+///   7. *(Network commissioning happens here for Thread/WiFi devices —
+///      not driven by this helper. For on-network devices the device
+///      is already on its operational network and this step is a
+///      no-op.)*
+///   8. `CommissioningComplete()` — device disarms fail-safe, swaps to
+///      operational identity, begins announcing on the operational
+///      network.
+///
+/// On success returns the issued NOC bundle + the FabricIndex the
+/// device assigned. Caller persists this alongside the device's NodeID
+/// and switches to CASE for all subsequent communication.
+pub struct PaseCommissionResult {
+    pub fabric_index: u8,
+    pub device_node_id: u64,
+    pub noc_der: heapless::Vec<u8, 400>,
+    pub icac_der: heapless::Vec<u8, 400>,
+}
+
+pub async fn commission_pase<C: Crypto>(
+    matter: &crate::Matter<'_>,
+    crypto: &C,
+    fabric_creds: &mut FabricCredentials,
+    admin_case_subject: u64,
+    admin_vendor_id: u16,
+    fail_safe_secs: u16,
+) -> Result<PaseCommissionResult, ControllerError> {
+    use rand::RngCore;
+
+    // 1. ArmFailSafe(fail_safe_secs, breadcrumb=0).
+    arm_fail_safe(matter, fail_safe_secs, 0).await?;
+
+    // 2. CSRRequest with a fresh random nonce.
+    let mut csr_nonce = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut csr_nonce);
+    let csr_payload = csr_request(matter, &csr_nonce).await?;
+
+    // 3. Decode NOCSRElements, verify the device echoed our nonce.
+    let nocsr = decode_nocsr_elements(&csr_payload.nocsr_elements)?;
+    if nocsr.csr_nonce != &csr_nonce[..] {
+        return Err(ControllerError::PaseFailed);
+    }
+
+    // 4. Issue NOC against our fabric's RCAC.
+    let device_creds = fabric_creds
+        .generate_device_credentials(crypto, nocsr.csr_der, &[])
+        .map_err(ControllerError::from)?;
+
+    // 5. AddTrustedRootCertificate — install RCAC so the chain
+    //    validates on the device.
+    add_trusted_root_certificate(matter, fabric_creds.root_cert()).await?;
+
+    // 6. AddNOC.
+    let icac_bytes: &[u8] = device_creds
+        .icac
+        .as_ref()
+        .map(|v| v.as_slice())
+        .unwrap_or(&[]);
+    let ipk_ref = fabric_creds.ipk();
+    let result = add_noc(
+        matter,
+        &device_creds.noc,
+        icac_bytes,
+        ipk_ref.access(),
+        admin_case_subject,
+        admin_vendor_id,
+    )
+    .await?;
+
+    // 7. CommissioningComplete.
+    commissioning_complete(matter).await?;
+
+    let mut noc_out: heapless::Vec<u8, 400> = heapless::Vec::new();
+    noc_out.extend_from_slice(&device_creds.noc).map_err(|_| {
+        ControllerError::Inner(crate::error::Error::new(
+            crate::error::ErrorCode::BufferTooSmall,
+        ))
+    })?;
+    let mut icac_out: heapless::Vec<u8, 400> = heapless::Vec::new();
+    if let Some(icac) = device_creds.icac.as_ref() {
+        icac_out.extend_from_slice(icac).map_err(|_| {
+            ControllerError::Inner(crate::error::Error::new(
+                crate::error::ErrorCode::BufferTooSmall,
+            ))
+        })?;
+    }
+
+    Ok(PaseCommissionResult {
+        fabric_index: result.fabric_index,
+        device_node_id: device_creds.node_id,
+        noc_der: noc_out,
+        icac_der: icac_out,
+    })
+}
+
 fn locator_addr_bytes(loc: &OperationalLocator) -> [u8; 16] {
     use crate::transport::network::Address;
     let sock_addr = match loc.address {
