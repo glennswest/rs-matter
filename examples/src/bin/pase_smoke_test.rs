@@ -27,7 +27,10 @@ use std::net::{SocketAddr, UdpSocket};
 use async_io::Async;
 use log::{error, info};
 
-use rs_matter::controller::commissioner::{arm_fail_safe, csr_request};
+use rs_matter::commissioner::FabricCredentials;
+use rs_matter::controller::commissioner::{
+    arm_fail_safe, commission_pase, csr_request,
+};
 use rs_matter::crypto::default_crypto;
 use rs_matter::dm::devices::test::{DAC_PRIVKEY, TEST_DEV_ATT, TEST_DEV_COMM, TEST_DEV_DET};
 use rs_matter::sc::pase::PaseInitiator;
@@ -121,6 +124,29 @@ fn run() -> Result<(), String> {
                 "✓✓✓ CSRRequest completed — got {}B NOCSRElements + {}B AttestationSignature",
                 csr.nocsr_elements.len(),
                 csr.attestation_signature.len()
+            );
+
+            // Stage 4: full end-to-end commissioning. NOCSR decode →
+            // controller issues a NOC against its own fabric → installs
+            // RCAC → AddNOC → CommissioningComplete. After this the
+            // device is part of our fabric and should respond on its
+            // operational identity.
+            info!("building controller-side FabricCredentials (fabric_id=1)...");
+            let mut fabric_creds = FabricCredentials::new(&crypto, 1)
+                .map_err(|_| rs_matter::error::Error::new(rs_matter::error::ErrorCode::Invalid))?;
+            info!(
+                "calling commission_pase(admin_subject=112233, admin_vendor_id=0xFFF1, fs=60s)..."
+            );
+            let result = commission_pase(matter, &crypto, &mut fabric_creds, 112233, 0xFFF1, 60)
+                .await
+                .map_err(|_| rs_matter::error::Error::new(rs_matter::error::ErrorCode::NoExchange))?;
+            info!(
+                "✓✓✓✓ commission_pase done — fabric_index={} device_node_id=0x{:016x} \
+                 noc={}B icac={}B",
+                result.fabric_index,
+                result.device_node_id,
+                result.noc_der.len(),
+                result.icac_der.len()
             );
             Ok::<(), rs_matter::error::Error>(())
         };
