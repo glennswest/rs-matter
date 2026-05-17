@@ -73,6 +73,7 @@ use core::num::NonZeroU8;
 use crate::commissioner::FabricCredentials;
 use crate::crypto::Crypto;
 use crate::im::client::{ImClient, TxOutcome};
+use crate::im::CmdDataTag;
 use crate::sc::pase::PaseInitiator;
 use crate::tlv::{TLVTag, TLVWrite};
 use crate::transport::exchange::Exchange;
@@ -622,11 +623,15 @@ pub async fn arm_fail_safe(
                     .path(COMMISSIONING_ENDPOINT, CL_GENERAL_COMMISSIONING, CMD_ARM_FAIL_SAFE)
                     .map_err(ControllerError::from)?
                     .data(|w| {
-                        // ArmFailSafe fields:
+                        // CommandFields per Matter §8.7 is a struct at
+                        // CmdDataTag::Data (Context(1)). Inside it we
+                        // write the ArmFailSafe fields by field-id:
                         //   0: ExpiryLengthSeconds (u16)
                         //   1: Breadcrumb (u64)
+                        w.start_struct(&TLVTag::Context(CmdDataTag::Data as u8))?;
                         w.u16(&TLVTag::Context(0), expiry_seconds)?;
                         w.u64(&TLVTag::Context(1), breadcrumb)?;
+                        w.end_container()?;
                         Ok(())
                     })
                     .map_err(ControllerError::from)?
@@ -690,8 +695,12 @@ async fn add_trusted_root_certificate(
                     )
                     .map_err(ControllerError::from)?
                     .data(|w| {
-                        // Field 0: RootCACertificate (octet-string TLV blob)
-                        w.str(&TLVTag::Context(0), rcac_tlv)
+                        // CommandFields struct at CmdDataTag::Data
+                        // containing field 0: RootCACertificate (octstr).
+                        w.start_struct(&TLVTag::Context(CmdDataTag::Data as u8))?;
+                        w.str(&TLVTag::Context(0), rcac_tlv)?;
+                        w.end_container()?;
+                        Ok(())
                     })
                     .map_err(ControllerError::from)?
                     .end()
@@ -746,7 +755,14 @@ async fn commissioning_complete(matter: &Matter<'_>) -> Result<(), ControllerErr
                         CMD_COMMISSIONING_COMPLETE,
                     )
                     .map_err(ControllerError::from)?
-                    .data(|_w| Ok(()))
+                    .data(|w| {
+                        // CommissioningComplete has no fields; emit an
+                        // empty CommandFields struct so the TLV shape
+                        // matches the schema.
+                        w.start_struct(&TLVTag::Context(CmdDataTag::Data as u8))?;
+                        w.end_container()?;
+                        Ok(())
+                    })
                     .map_err(ControllerError::from)?
                     .end()
                     .map_err(ControllerError::from)?
