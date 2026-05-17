@@ -645,11 +645,38 @@ pub async fn arm_fail_safe(
             TxOutcome::GotResponse(c) => break c,
         }
     };
-    // Drain response chunks. ArmFailSafeResponse carries
-    // {ErrorCode, DebugText} but we currently treat any transport-level
-    // success as success; future enhancement: decode + bail on
-    // ErrorCode != 0 (OK).
+    // Walk response chunks and decode ArmFailSafeResponse.ErrorCode.
+    // CommissioningErrorEnum::OK = 0; anything else means the arm
+    // didn't take (e.g. failsafe held by another controller, bad
+    // regulatory config, etc.) and subsequent commissioning IM invokes
+    // will fail with InvalidCommand. Bubble it up as ControllerError
+    // so the operator sees the actual cause rather than a downstream
+    // ghost "no response" error.
+    use crate::dm::clusters::gen_comm::ArmFailSafeResponse;
+    let mut got_response = false;
     loop {
+        if !got_response {
+            if let Some(resp) = chunk.response().map_err(ControllerError::from)? {
+                for (_endpoint, r) in resp.responses::<ArmFailSafeResponse>(
+                    CL_GENERAL_COMMISSIONING,
+                    // The response cluster command id matches the request's
+                    // — ArmFailSafe(0x00) → ArmFailSafeResponse(0x00).
+                    CMD_ARM_FAIL_SAFE,
+                ) {
+                    match r {
+                        Ok(afs) => {
+                            let code = afs.error_code().map_err(ControllerError::from)?;
+                            if (code as u8) != 0 {
+                                return Err(ControllerError::FailSafeExpired);
+                            }
+                            got_response = true;
+                            break;
+                        }
+                        Err(e) => return Err(ControllerError::Inner(e)),
+                    }
+                }
+            }
+        }
         match chunk.complete().await.map_err(ControllerError::from)? {
             Some(next) => chunk = next,
             None => break,
