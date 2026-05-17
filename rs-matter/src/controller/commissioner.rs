@@ -658,6 +658,244 @@ pub async fn arm_fail_safe(
     Ok(())
 }
 
+/// Maximum NOCSRElements payload we'll accept back from a device. Per
+/// spec the field is `octstr<400>` (Matter §11.18.6.6); rounding up to
+/// a heapless::Vec of 512 keeps us defensive against future field-size
+/// bumps.
+pub const MAX_NOCSR_ELEMENTS_LEN: usize = 512;
+
+/// Bytes returned by a successful CSRRequest. The two payloads each get
+/// passed into different downstream steps:
+///   - `nocsr_elements` → `FabricCredentials::generate_device_credentials`
+///     (it contains the device's actual operational CSR, wrapped in a
+///     TLV envelope that bundles a server-chosen nonce echo).
+///   - `attestation_signature` → verified against the device's DAC public
+///     key (extracted from its earlier AttestationResponse / certs).
+pub struct CsrPayload {
+    pub nocsr_elements: heapless::Vec<u8, MAX_NOCSR_ELEMENTS_LEN>,
+    pub attestation_signature: heapless::Vec<u8, 64>,
+}
+
+/// Invoke `OperationalCredentials::CSRRequest(csr_nonce, is_for_update_noc?)`
+/// on endpoint 0 over the PASE-secured exchange. Decodes the CSRResponse
+/// and returns the NOCSRElements + signature.
+///
+/// The 32-byte `csr_nonce` MUST be random per invocation (Matter
+/// §11.18.6.5 requires the device echo it inside the signed
+/// NOCSRElements blob — replaying the same nonce defeats freshness).
+pub async fn csr_request(
+    matter: &Matter<'_>,
+    csr_nonce: &[u8; 32],
+) -> Result<CsrPayload, ControllerError> {
+    use crate::dm::clusters::noc::CSRResponse;
+    use crate::error::Error;
+
+    let exchange = Exchange::initiate(matter, 0, 0, true)
+        .await
+        .map_err(ControllerError::from)?;
+    let mut sender = exchange
+        .invoke_sender(None)
+        .await
+        .map_err(ControllerError::from)?;
+    let mut chunk = loop {
+        match sender.tx().await.map_err(ControllerError::from)? {
+            TxOutcome::BuildRequest(builder) => {
+                sender = builder
+                    .suppress_response(false)
+                    .map_err(ControllerError::from)?
+                    .timed_request(false)
+                    .map_err(ControllerError::from)?
+                    .invoke_requests()
+                    .map_err(ControllerError::from)?
+                    .push()
+                    .map_err(ControllerError::from)?
+                    .path(
+                        COMMISSIONING_ENDPOINT,
+                        CL_OPERATIONAL_CREDENTIALS,
+                        CMD_CSR_REQUEST,
+                    )
+                    .map_err(ControllerError::from)?
+                    .data(|w| {
+                        // CommandFields struct at CmdDataTag::Data
+                        // containing field 0: CSRNonce (32-byte octstr).
+                        w.start_struct(&TLVTag::Context(CmdDataTag::Data as u8))?;
+                        w.str(&TLVTag::Context(0), csr_nonce)?;
+                        w.end_container()?;
+                        Ok(())
+                    })
+                    .map_err(ControllerError::from)?
+                    .end()
+                    .map_err(ControllerError::from)?
+                    .end()
+                    .map_err(ControllerError::from)?
+                    .end()
+                    .map_err(ControllerError::from)?;
+            }
+            TxOutcome::GotResponse(c) => break c,
+        }
+    };
+
+    // Walk response chunks, extract the first CSRResponse payload, then
+    // drain whatever's left for clean exchange teardown.
+    let mut payload: Option<CsrPayload> = None;
+    loop {
+        if payload.is_none() {
+            if let Some(resp) = chunk.response().map_err(ControllerError::from)? {
+                for (_endpoint, result) in
+                    resp.responses::<CSRResponse>(CL_OPERATIONAL_CREDENTIALS, CMD_CSR_REQUEST)
+                {
+                    match result {
+                        Ok(csr_resp) => {
+                            let nocsr_bytes = csr_resp.nocsr_elements()
+                                .map_err(ControllerError::from)?;
+                            let sig_bytes = csr_resp.attestation_signature()
+                                .map_err(ControllerError::from)?;
+                            let mut nocsr: heapless::Vec<u8, MAX_NOCSR_ELEMENTS_LEN> =
+                                heapless::Vec::new();
+                            nocsr.extend_from_slice(nocsr_bytes.0).map_err(|_| {
+                                ControllerError::Inner(Error::new(
+                                    crate::error::ErrorCode::BufferTooSmall,
+                                ))
+                            })?;
+                            let mut sig: heapless::Vec<u8, 64> = heapless::Vec::new();
+                            sig.extend_from_slice(sig_bytes.0).map_err(|_| {
+                                ControllerError::Inner(Error::new(
+                                    crate::error::ErrorCode::BufferTooSmall,
+                                ))
+                            })?;
+                            payload = Some(CsrPayload {
+                                nocsr_elements: nocsr,
+                                attestation_signature: sig,
+                            });
+                            break;
+                        }
+                        Err(e) => return Err(ControllerError::Inner(e)),
+                    }
+                }
+            }
+        }
+        match chunk.complete().await.map_err(ControllerError::from)? {
+            Some(next) => chunk = next,
+            None => break,
+        }
+    }
+    payload.ok_or(ControllerError::PaseFailed)
+}
+
+/// Result of a successful AddNOC.
+pub struct AddNocResult {
+    /// Fabric slot the device assigned us. Persist this alongside the
+    /// device's NodeID — it's needed for any subsequent UpdateNOC /
+    /// RemoveFabric operations.
+    pub fabric_index: u8,
+}
+
+/// Invoke `OperationalCredentials::AddNOC(noc, icac?, ipk, admin_subject,
+/// admin_vendor_id)` on endpoint 0 over the PASE-secured exchange.
+/// Returns the device-assigned FabricIndex.
+///
+/// `icac` may be empty when the controller signs NOCs directly from the
+/// Root CA (the simpler chain — what `FabricCredentials::new` produces
+/// before `enable_icac` is called).
+pub async fn add_noc(
+    matter: &Matter<'_>,
+    noc: &[u8],
+    icac: &[u8],
+    ipk: &[u8],
+    admin_case_subject: u64,
+    admin_vendor_id: u16,
+) -> Result<AddNocResult, ControllerError> {
+    use crate::dm::clusters::noc::NOCResponse;
+    use crate::error::Error;
+
+    let exchange = Exchange::initiate(matter, 0, 0, true)
+        .await
+        .map_err(ControllerError::from)?;
+    let mut sender = exchange
+        .invoke_sender(None)
+        .await
+        .map_err(ControllerError::from)?;
+    let mut chunk = loop {
+        match sender.tx().await.map_err(ControllerError::from)? {
+            TxOutcome::BuildRequest(builder) => {
+                sender = builder
+                    .suppress_response(false)
+                    .map_err(ControllerError::from)?
+                    .timed_request(false)
+                    .map_err(ControllerError::from)?
+                    .invoke_requests()
+                    .map_err(ControllerError::from)?
+                    .push()
+                    .map_err(ControllerError::from)?
+                    .path(COMMISSIONING_ENDPOINT, CL_OPERATIONAL_CREDENTIALS, CMD_ADD_NOC)
+                    .map_err(ControllerError::from)?
+                    .data(|w| {
+                        // CommandFields struct at CmdDataTag::Data.
+                        // Fields per Matter §11.18.6.8:
+                        //   0: NOCValue (octstr400)
+                        //   1: ICACValue (octstr400) — present even if empty?
+                        //   2: IPKValue (octstr16)
+                        //   3: CaseAdminSubject (NodeID = u64)
+                        //   4: AdminVendorId (u16)
+                        w.start_struct(&TLVTag::Context(CmdDataTag::Data as u8))?;
+                        w.str(&TLVTag::Context(0), noc)?;
+                        w.str(&TLVTag::Context(1), icac)?;
+                        w.str(&TLVTag::Context(2), ipk)?;
+                        w.u64(&TLVTag::Context(3), admin_case_subject)?;
+                        w.u16(&TLVTag::Context(4), admin_vendor_id)?;
+                        w.end_container()?;
+                        Ok(())
+                    })
+                    .map_err(ControllerError::from)?
+                    .end()
+                    .map_err(ControllerError::from)?
+                    .end()
+                    .map_err(ControllerError::from)?
+                    .end()
+                    .map_err(ControllerError::from)?;
+            }
+            TxOutcome::GotResponse(c) => break c,
+        }
+    };
+
+    let mut result: Option<AddNocResult> = None;
+    loop {
+        if result.is_none() {
+            if let Some(resp) = chunk.response().map_err(ControllerError::from)? {
+                for (_endpoint, r) in
+                    resp.responses::<NOCResponse>(CL_OPERATIONAL_CREDENTIALS, CMD_ADD_NOC)
+                {
+                    match r {
+                        Ok(noc_resp) => {
+                            let status = noc_resp.status_code()
+                                .map_err(ControllerError::from)?;
+                            // NodeOperationalCertStatusEnum::Ok = 0
+                            if (status as u8) != 0 {
+                                return Err(ControllerError::AddNocRejected);
+                            }
+                            let fabric_index = noc_resp
+                                .fabric_index()
+                                .map_err(ControllerError::from)?
+                                .ok_or(ControllerError::AddNocRejected)?;
+                            result = Some(AddNocResult {
+                                fabric_index: fabric_index.into(),
+                            });
+                            break;
+                        }
+                        Err(e) => return Err(ControllerError::Inner(e)),
+                    }
+                }
+            }
+        }
+        match chunk.complete().await.map_err(ControllerError::from)? {
+            Some(next) => chunk = next,
+            None => break,
+        }
+    }
+    let _ = Error::new(crate::error::ErrorCode::NoExchange); // silence unused import
+    result.ok_or(ControllerError::AddNocRejected)
+}
+
 /// Invoke `OperationalCredentials::AddTrustedRootCertificate(rcac_tlv)`
 /// on endpoint 0. Installs our fabric's Root CA on the device so the
 /// subsequent AddNOC's certificate chain validates.

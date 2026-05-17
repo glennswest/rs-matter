@@ -27,7 +27,7 @@ use std::net::{SocketAddr, UdpSocket};
 use async_io::Async;
 use log::{error, info};
 
-use rs_matter::controller::commissioner::arm_fail_safe;
+use rs_matter::controller::commissioner::{arm_fail_safe, csr_request};
 use rs_matter::crypto::default_crypto;
 use rs_matter::dm::devices::test::{DAC_PRIVKEY, TEST_DEV_ATT, TEST_DEV_COMM, TEST_DEV_DET};
 use rs_matter::sc::pase::PaseInitiator;
@@ -106,7 +106,22 @@ fn run() -> Result<(), String> {
             arm_fail_safe(matter, 60, 0)
                 .await
                 .map_err(|_| rs_matter::error::Error::new(rs_matter::error::ErrorCode::NoExchange))?;
-            info!("✓✓✓ ArmFailSafe completed — PASE-secured IM invoke works end-to-end");
+            info!("✓ ArmFailSafe completed");
+
+            // Stage 3: CSRRequest over PASE — exercises response-bearing
+            // IM invoke (decode NOCSRElements from the device's reply).
+            use rand::RngCore;
+            let mut nonce = [0u8; 32];
+            rand::thread_rng().fill_bytes(&mut nonce);
+            info!("calling CSRRequest(random 32B nonce) over PASE...");
+            let csr = csr_request(matter, &nonce)
+                .await
+                .map_err(|_| rs_matter::error::Error::new(rs_matter::error::ErrorCode::NoExchange))?;
+            info!(
+                "✓✓✓ CSRRequest completed — got {}B NOCSRElements + {}B AttestationSignature",
+                csr.nocsr_elements.len(),
+                csr.attestation_signature.len()
+            );
             Ok::<(), rs_matter::error::Error>(())
         };
 
