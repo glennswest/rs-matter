@@ -1,0 +1,128 @@
+//! Minimal end-to-end PASE smoke test.
+//!
+//! Usage:
+//!   1. In one terminal: `cargo run --release --bin onoff_light`
+//!      (or any rs-matter responder that opens a Basic Commissioning Window).
+//!   2. In another terminal: `cargo run --release --bin pase_smoke_test`
+//!
+//! What it does:
+//!   - Constructs a controller-side `Matter` bound to port 5541 (so it
+//!     doesn't fight the responder for the standard 5540).
+//!   - Opens an unsecured exchange to `127.0.0.1:5540` (the responder).
+//!   - Drives `PaseInitiator::initiate` with passcode 20202021 (the
+//!     canonical test passcode that onoff_light + chip_tool_tests use).
+//!   - Reports whether PASE completed.
+//!
+//! Success = the responder's "PASE Basic Commissioning Window" picks up,
+//! Spake2+ messages exchange, and `PaseInitiator::initiate` returns `Ok(())`.
+//! Failure = first stage where the handshake broke down. The output of
+//! both processes together identifies the offending step.
+//!
+//! This is the test the controller-side commissioner work has been
+//! building toward — proves PASE *actually negotiates over the wire*
+//! between rs-matter's responder and our `PaseInitiator` driver.
+
+use std::net::{SocketAddr, UdpSocket};
+
+use async_io::Async;
+use log::{error, info};
+
+use rs_matter::crypto::default_crypto;
+use rs_matter::dm::devices::test::{DAC_PRIVKEY, TEST_DEV_ATT, TEST_DEV_COMM, TEST_DEV_DET};
+use rs_matter::sc::pase::PaseInitiator;
+use rs_matter::transport::exchange::Exchange;
+use rs_matter::transport::network::Address;
+use rs_matter::{Matter, MATTER_PORT};
+
+const SMOKE_TEST_PORT: u16 = 5541;
+const RESPONDER_PORT: u16 = MATTER_PORT; // 5540
+// IPv6 localhost — matches the bind on [::]:SMOKE_TEST_PORT. Mixing v4
+// peer + v6 socket fails with EINVAL on macOS (and is iffy on Linux too
+// without IPV6_V6ONLY=0). rs-matter's whole transport is IPv6-native.
+const RESPONDER_ADDR: &str = "[::1]";
+const PASSCODE: u32 = 20202021;
+
+fn main() {
+    env_logger::init();
+    info!("PASE smoke test starting (controller side)");
+
+    // Run the whole thing on a stack-size-bumped thread — `Matter`'s
+    // futures want ~550 KB of stack (matches what onoff_light does).
+    let thread = std::thread::Builder::new()
+        .stack_size(550 * 1024)
+        .spawn(|| {
+            if let Err(e) = run() {
+                error!("smoke test thread error: {}", e);
+                std::process::exit(1);
+            }
+        })
+        .expect("spawn");
+    thread.join().expect("join");
+}
+
+fn run() -> Result<(), String> {
+    // 1. Controller-side Matter runtime. We use the same TEST_DEV_*
+    //    fixtures the device side uses — the controller doesn't actually
+    //    serve attestation to peers, but the constructor needs the refs.
+    let matter = Box::leak(Box::new(Matter::new_default(
+        &TEST_DEV_DET,
+        TEST_DEV_COMM.clone(),
+        &TEST_DEV_ATT,
+        SMOKE_TEST_PORT,
+    )));
+
+    let bind_addr: SocketAddr = format!("[::]:{}", SMOKE_TEST_PORT)
+        .parse()
+        .map_err(|e: std::net::AddrParseError| e.to_string())?;
+    let socket = Async::<UdpSocket>::bind(bind_addr).map_err(|e| e.to_string())?;
+    info!(
+        "controller bound on UDP {} (responder at {}:{})",
+        SMOKE_TEST_PORT, RESPONDER_ADDR, RESPONDER_PORT
+    );
+
+    let crypto = default_crypto(rand::thread_rng(), DAC_PRIVKEY);
+
+    let main = async move {
+        let peer_addr: SocketAddr = format!("{}:{}", RESPONDER_ADDR, RESPONDER_PORT).parse().unwrap();
+        let peer = Address::Udp(peer_addr);
+
+        // Run the matter transport in parallel with the PASE handshake.
+        // PASE needs the transport pump alive to send/receive.
+        let transport_fut = matter.run(&crypto, &socket, &socket, &socket);
+        let pase_fut = async {
+            info!("opening unsecured exchange to {}", peer_addr);
+            let mut exchange = Exchange::initiate_unsecured(matter, &crypto, peer).await?;
+            info!("unsecured exchange open — driving PASE with passcode {}", PASSCODE);
+            PaseInitiator::initiate(&mut exchange, &crypto, PASSCODE).await?;
+            info!("✓✓✓ PASE handshake completed successfully");
+            Ok::<(), rs_matter::error::Error>(())
+        };
+
+        match futures_lite::future::or(
+            async {
+                let r = pase_fut.await;
+                match &r {
+                    Ok(()) => info!("controller-side PASE flow returned Ok"),
+                    Err(e) => error!("controller-side PASE flow returned Err: {:?}", e),
+                }
+                r
+            },
+            async {
+                transport_fut.await.unwrap_or_else(|e| {
+                    error!("transport future ended: {:?}", e);
+                });
+                Err(rs_matter::error::Error::new(
+                    rs_matter::error::ErrorCode::NoExchange,
+                ))
+            },
+        )
+        .await
+        {
+            Ok(()) => info!("smoke test PASS"),
+            Err(e) => error!("smoke test FAIL: {:?}", e),
+        }
+    };
+
+    async_io::block_on(main);
+    Ok(())
+}
