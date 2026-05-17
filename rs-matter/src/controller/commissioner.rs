@@ -72,6 +72,11 @@ use core::num::NonZeroU8;
 
 use crate::commissioner::FabricCredentials;
 use crate::crypto::Crypto;
+use crate::im::client::{ImClient, TxOutcome};
+use crate::sc::pase::PaseInitiator;
+use crate::tlv::{TLVTag, TLVWrite};
+use crate::transport::exchange::Exchange;
+use crate::transport::network::Address;
 use crate::Matter;
 
 use super::ble::BleAdapter;
@@ -80,6 +85,28 @@ use super::operational::{OperationalClient, OperationalLocator};
 use super::setup_code::{parse_setup_code, SetupPayload};
 use super::store::{ControllerStore, StoredNode};
 use super::ControllerError;
+
+// ─── Matter commissioning cluster + command IDs ──────────────────────────
+// Application Cluster Spec references in parens.
+
+const CL_GENERAL_COMMISSIONING: u32 = 0x0030;
+const CMD_ARM_FAIL_SAFE: u32 = 0x00; // §11.10.6.1
+const CMD_COMMISSIONING_COMPLETE: u32 = 0x04; // §11.10.6.6
+
+const CL_OPERATIONAL_CREDENTIALS: u32 = 0x003E;
+const CMD_ATTESTATION_REQUEST: u32 = 0x00; // §11.18.6.1
+const CMD_CSR_REQUEST: u32 = 0x04; // §11.18.6.5
+const CMD_ADD_NOC: u32 = 0x06; // §11.18.6.8
+const CMD_ADD_TRUSTED_ROOT_CERTIFICATE: u32 = 0x0B; // §11.18.6.13
+
+const CL_NETWORK_COMMISSIONING: u32 = 0x0031;
+const CMD_ADD_OR_UPDATE_THREAD_NETWORK: u32 = 0x03; // §11.9.7.4
+const CMD_CONNECT_NETWORK: u32 = 0x06; // §11.9.7.9
+
+// Endpoint 0 (Root Node) hosts the GeneralCommissioning / OperationalCredentials
+// / NetworkCommissioning clusters during commissioning — that's the Matter
+// spec invariant we rely on.
+const COMMISSIONING_ENDPOINT: u16 = 0;
 
 /// 64-bit Node Identifier within a fabric (Matter spec §2.5.5).
 pub type NodeId = u64;
@@ -161,6 +188,71 @@ impl Commissioner {
     /// Current stage. Useful for UI progress reporting.
     pub fn progress(&self) -> CommissioningStage {
         self.stage
+    }
+
+    /// Commission a Matter accessory already reachable on the operational
+    /// network (no BLE step). The peer must be in commissioning mode and
+    /// listening on `peer_addr` (typically discovered via mDNS-SD lookup
+    /// of `_matterc._udp.local`).
+    ///
+    /// This is the simpler of the two commissioning entry points — many
+    /// Matter accessories support on-network commissioning via Ethernet
+    /// or an already-onboarded Wi-Fi connection, so the BLE path can be
+    /// skipped entirely. Use [`Self::commission_with_code`] when the only
+    /// transport available is BLE.
+    pub async fn commission_on_network<C, N, S>(
+        &mut self,
+        matter: &Matter<'_>,
+        crypto: &C,
+        fabric_idx: NonZeroU8,
+        fabric_credentials: &mut FabricCredentials,
+        network: &N,
+        store: &mut S,
+        code: &str,
+        peer_addr: Address,
+    ) -> Result<NodeId, ControllerError>
+    where
+        C: Crypto + Clone,
+        N: NetworkCredentialProvider,
+        S: ControllerStore,
+    {
+        // 1. Decode the setup payload — same parser as the BLE path.
+        self.stage = CommissioningStage::Parsing;
+        let payload = parse_setup_code(code).map_err(|_| ControllerError::PaseFailed)?;
+
+        // 2. Open an unsecured exchange to the peer. This is what
+        //    PaseInitiator uses as its transport for the PASE handshake;
+        //    once the handshake succeeds, the underlying session is
+        //    upgraded to PASE-secured and subsequent invocations on
+        //    secured exchanges to the same peer go encrypted.
+        self.stage = CommissioningStage::PaseHandshake;
+        let mut exchange = Exchange::initiate_unsecured(matter, crypto.clone(), peer_addr)
+            .await
+            .map_err(ControllerError::from)?;
+
+        // 3. Drive PASE — Spake2+ over the unsecured exchange. On success
+        //    the next exchange we open to this peer will use the PASE-
+        //    derived keys for encryption (rs-matter's session manager
+        //    handles the swap transparently — keyed on fab=0/peer=0).
+        PaseInitiator::initiate(&mut exchange, crypto.clone(), payload.passcode)
+            .await
+            .map_err(|_| ControllerError::PaseFailed)?;
+        drop(exchange); // unsecured exchange done; future opens are PASE-secured
+
+        // 4. ArmFailSafe — give ourselves 60s to complete commissioning
+        //    before the device auto-rolls back. Each IM invoke from here
+        //    opens its own PASE-secured exchange via
+        //    Exchange::initiate(matter, fab=0, peer=0, secure=true).
+        self.stage = CommissioningStage::ArmFailSafe;
+        arm_fail_safe(matter, 60, 0).await?;
+
+        // TODO: stages 5-12 (ReadVendorInfo / AttestationVerify /
+        // CSRRequest / NocIssuance / AddTrustedRoot / AddNOC /
+        // NetworkCommissioning / CommissioningComplete) — each is a
+        // similar TLV-builder dance against the PASE-secured exchange.
+        // The next commits fill these in one at a time.
+        let _ = (fabric_credentials, network, store);
+        Err(ControllerError::PaseFailed)
     }
 
     /// Commission a device using an 11-digit pairing code or QR
@@ -486,6 +578,190 @@ impl Commissioner {
         let op = OperationalClient::new(ctx.matter, ctx.crypto, ctx.fabric_idx);
         op.establish_case(locator).await.map_err(ControllerError::from)
     }
+}
+
+// ─── IM invoke helpers ──────────────────────────────────────────────────
+//
+// Each commissioning stage that talks to a cluster on the peer needs
+// the same shape: drive the InvokeSender retransmit loop, build the
+// cluster-specific TLV body in the data() closure, await response.
+// Factored here so the state machine reads top-down.
+
+/// Invoke `GeneralCommissioning::ArmFailSafe(expiry_seconds, breadcrumb)`
+/// on endpoint 0. Opens a fresh PASE-secured exchange (fab=0, peer=0,
+/// secure=true — the Matter session manager keys PASE sessions on
+/// that tuple). Fire-and-forget — the response carries an ErrorCode
+/// we don't yet decode (treating reachable-completion as success).
+async fn arm_fail_safe(
+    matter: &Matter<'_>,
+    expiry_seconds: u16,
+    breadcrumb: u64,
+) -> Result<(), ControllerError> {
+    let exchange = Exchange::initiate(matter, 0, 0, true)
+        .await
+        .map_err(ControllerError::from)?;
+    let mut sender = exchange
+        .invoke_sender(None)
+        .await
+        .map_err(ControllerError::from)?;
+    let mut chunk = loop {
+        match sender.tx().await.map_err(ControllerError::from)? {
+            TxOutcome::BuildRequest(builder) => {
+                sender = builder
+                    .suppress_response(false)
+                    .map_err(ControllerError::from)?
+                    .timed_request(false)
+                    .map_err(ControllerError::from)?
+                    .invoke_requests()
+                    .map_err(ControllerError::from)?
+                    .push()
+                    .map_err(ControllerError::from)?
+                    .path(COMMISSIONING_ENDPOINT, CL_GENERAL_COMMISSIONING, CMD_ARM_FAIL_SAFE)
+                    .map_err(ControllerError::from)?
+                    .data(|w| {
+                        // ArmFailSafe fields:
+                        //   0: ExpiryLengthSeconds (u16)
+                        //   1: Breadcrumb (u64)
+                        w.u16(&TLVTag::Context(0), expiry_seconds)?;
+                        w.u64(&TLVTag::Context(1), breadcrumb)?;
+                        Ok(())
+                    })
+                    .map_err(ControllerError::from)?
+                    .end()
+                    .map_err(ControllerError::from)?
+                    .end()
+                    .map_err(ControllerError::from)?
+                    .end()
+                    .map_err(ControllerError::from)?;
+            }
+            TxOutcome::GotResponse(c) => break c,
+        }
+    };
+    // Drain response chunks. ArmFailSafeResponse carries
+    // {ErrorCode, DebugText} but we currently treat any transport-level
+    // success as success; future enhancement: decode + bail on
+    // ErrorCode != 0 (OK).
+    loop {
+        match chunk.complete().await.map_err(ControllerError::from)? {
+            Some(next) => chunk = next,
+            None => break,
+        }
+    }
+    Ok(())
+}
+
+/// Invoke `OperationalCredentials::AddTrustedRootCertificate(rcac_tlv)`
+/// on endpoint 0. Installs our fabric's Root CA on the device so the
+/// subsequent AddNOC's certificate chain validates.
+///
+/// Response is status-only (no payload). Treating reachable-completion
+/// as success — future enhancement would decode the StatusResponse and
+/// surface non-success codes.
+async fn add_trusted_root_certificate(
+    matter: &Matter<'_>,
+    rcac_tlv: &[u8],
+) -> Result<(), ControllerError> {
+    let exchange = Exchange::initiate(matter, 0, 0, true)
+        .await
+        .map_err(ControllerError::from)?;
+    let mut sender = exchange
+        .invoke_sender(None)
+        .await
+        .map_err(ControllerError::from)?;
+    let mut chunk = loop {
+        match sender.tx().await.map_err(ControllerError::from)? {
+            TxOutcome::BuildRequest(builder) => {
+                sender = builder
+                    .suppress_response(false)
+                    .map_err(ControllerError::from)?
+                    .timed_request(false)
+                    .map_err(ControllerError::from)?
+                    .invoke_requests()
+                    .map_err(ControllerError::from)?
+                    .push()
+                    .map_err(ControllerError::from)?
+                    .path(
+                        COMMISSIONING_ENDPOINT,
+                        CL_OPERATIONAL_CREDENTIALS,
+                        CMD_ADD_TRUSTED_ROOT_CERTIFICATE,
+                    )
+                    .map_err(ControllerError::from)?
+                    .data(|w| {
+                        // Field 0: RootCACertificate (octet-string TLV blob)
+                        w.str(&TLVTag::Context(0), rcac_tlv)
+                    })
+                    .map_err(ControllerError::from)?
+                    .end()
+                    .map_err(ControllerError::from)?
+                    .end()
+                    .map_err(ControllerError::from)?
+                    .end()
+                    .map_err(ControllerError::from)?;
+            }
+            TxOutcome::GotResponse(c) => break c,
+        }
+    };
+    loop {
+        match chunk.complete().await.map_err(ControllerError::from)? {
+            Some(next) => chunk = next,
+            None => break,
+        }
+    }
+    Ok(())
+}
+
+/// Invoke `GeneralCommissioning::CommissioningComplete()` on endpoint 0.
+/// No fields. Marks the end of commissioning — the device disarms its
+/// fail-safe, swaps from PASE to its operational identity, and begins
+/// announcing on the operational network.
+///
+/// After this returns, the PASE session should be torn down by the
+/// caller and operational discovery + CASE should begin.
+async fn commissioning_complete(matter: &Matter<'_>) -> Result<(), ControllerError> {
+    let exchange = Exchange::initiate(matter, 0, 0, true)
+        .await
+        .map_err(ControllerError::from)?;
+    let mut sender = exchange
+        .invoke_sender(None)
+        .await
+        .map_err(ControllerError::from)?;
+    let mut chunk = loop {
+        match sender.tx().await.map_err(ControllerError::from)? {
+            TxOutcome::BuildRequest(builder) => {
+                sender = builder
+                    .suppress_response(false)
+                    .map_err(ControllerError::from)?
+                    .timed_request(false)
+                    .map_err(ControllerError::from)?
+                    .invoke_requests()
+                    .map_err(ControllerError::from)?
+                    .push()
+                    .map_err(ControllerError::from)?
+                    .path(
+                        COMMISSIONING_ENDPOINT,
+                        CL_GENERAL_COMMISSIONING,
+                        CMD_COMMISSIONING_COMPLETE,
+                    )
+                    .map_err(ControllerError::from)?
+                    .data(|_w| Ok(()))
+                    .map_err(ControllerError::from)?
+                    .end()
+                    .map_err(ControllerError::from)?
+                    .end()
+                    .map_err(ControllerError::from)?
+                    .end()
+                    .map_err(ControllerError::from)?;
+            }
+            TxOutcome::GotResponse(c) => break c,
+        }
+    };
+    loop {
+        match chunk.complete().await.map_err(ControllerError::from)? {
+            Some(next) => chunk = next,
+            None => break,
+        }
+    }
+    Ok(())
 }
 
 /// Local placeholder for the BasicInformation cluster reads we'll do at
