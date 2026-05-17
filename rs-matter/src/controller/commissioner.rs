@@ -592,7 +592,10 @@ impl Commissioner {
 /// secure=true — the Matter session manager keys PASE sessions on
 /// that tuple). Fire-and-forget — the response carries an ErrorCode
 /// we don't yet decode (treating reachable-completion as success).
-async fn arm_fail_safe(
+///
+/// Public for use by smoke tests and direct callers that drive
+/// commissioning a stage at a time.
+pub async fn arm_fail_safe(
     matter: &Matter<'_>,
     expiry_seconds: u16,
     breadcrumb: u64,
