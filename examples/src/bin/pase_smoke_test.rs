@@ -27,6 +27,7 @@ use std::net::{SocketAddr, UdpSocket};
 use async_io::Async;
 use log::{error, info};
 
+use rs_matter::controller::commissioner::arm_fail_safe;
 use rs_matter::crypto::default_crypto;
 use rs_matter::dm::devices::test::{DAC_PRIVKEY, TEST_DEV_ATT, TEST_DEV_COMM, TEST_DEV_DET};
 use rs_matter::sc::pase::PaseInitiator;
@@ -94,7 +95,18 @@ fn run() -> Result<(), String> {
             let mut exchange = Exchange::initiate_unsecured(matter, &crypto, peer).await?;
             info!("unsecured exchange open — driving PASE with passcode {}", PASSCODE);
             PaseInitiator::initiate(&mut exchange, &crypto, PASSCODE).await?;
-            info!("✓✓✓ PASE handshake completed successfully");
+            info!("✓ PASE handshake completed");
+            drop(exchange); // PASE session now cached; subsequent opens are secured
+
+            // Stage 2: ArmFailSafe over the PASE-secured channel.
+            //   - Opens a fresh exchange (fab=0, peer=0, secure=true)
+            //   - Sends GeneralCommissioning::ArmFailSafe(60, 0)
+            //   - Waits for the device's ArmFailSafeResponse
+            info!("calling ArmFailSafe(60s, breadcrumb=0) over PASE...");
+            arm_fail_safe(matter, 60, 0)
+                .await
+                .map_err(|_| rs_matter::error::Error::new(rs_matter::error::ErrorCode::NoExchange))?;
+            info!("✓✓✓ ArmFailSafe completed — PASE-secured IM invoke works end-to-end");
             Ok::<(), rs_matter::error::Error>(())
         };
 
