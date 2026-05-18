@@ -108,7 +108,10 @@ fn run() -> Result<(), String> {
             info!("calling ArmFailSafe(60s, breadcrumb=0) over PASE...");
             arm_fail_safe(matter, 60, 0)
                 .await
-                .map_err(|_| rs_matter::error::Error::new(rs_matter::error::ErrorCode::NoExchange))?;
+                .map_err(|e| {
+                    error!("arm_fail_safe error: {:?}", e);
+                    rs_matter::error::Error::new(rs_matter::error::ErrorCode::NoExchange)
+                })?;
             info!("✓ ArmFailSafe completed");
 
             // Stage 3: CSRRequest over PASE — exercises response-bearing
@@ -119,7 +122,10 @@ fn run() -> Result<(), String> {
             info!("calling CSRRequest(random 32B nonce) over PASE...");
             let csr = csr_request(matter, &nonce)
                 .await
-                .map_err(|_| rs_matter::error::Error::new(rs_matter::error::ErrorCode::NoExchange))?;
+                .map_err(|e| {
+                    error!("csr_request error: {:?}", e);
+                    rs_matter::error::Error::new(rs_matter::error::ErrorCode::NoExchange)
+                })?;
             info!(
                 "✓✓✓ CSRRequest completed — got {}B NOCSRElements + {}B AttestationSignature",
                 csr.nocsr_elements.len(),
@@ -133,13 +139,19 @@ fn run() -> Result<(), String> {
             // operational identity.
             info!("building controller-side FabricCredentials (fabric_id=1)...");
             let mut fabric_creds = FabricCredentials::new(&crypto, 1)
-                .map_err(|_| rs_matter::error::Error::new(rs_matter::error::ErrorCode::Invalid))?;
+                .map_err(|e| {
+                    error!("FabricCredentials::new error: {:?}", e);
+                    rs_matter::error::Error::new(rs_matter::error::ErrorCode::Invalid)
+                })?;
             info!(
                 "calling commission_pase(admin_subject=112233, admin_vendor_id=0xFFF1, fs=60s)..."
             );
             let result = commission_pase(matter, &crypto, &mut fabric_creds, 112233, 0xFFF1, 60)
                 .await
-                .map_err(|_| rs_matter::error::Error::new(rs_matter::error::ErrorCode::NoExchange))?;
+                .map_err(|e| {
+                    error!("commission_pase error: {:?}", e);
+                    rs_matter::error::Error::new(rs_matter::error::ErrorCode::NoExchange)
+                })?;
             info!(
                 "✓✓✓✓ commission_pase done — fabric_index={} device_node_id=0x{:016x} \
                  noc={}B icac={}B",

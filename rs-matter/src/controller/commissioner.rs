@@ -92,12 +92,15 @@ use super::ControllerError;
 
 const CL_GENERAL_COMMISSIONING: u32 = 0x0030;
 const CMD_ARM_FAIL_SAFE: u32 = 0x00; // §11.10.6.1
+const CMD_ARM_FAIL_SAFE_RESPONSE: u32 = 0x01; // §11.10.6.2
 const CMD_COMMISSIONING_COMPLETE: u32 = 0x04; // §11.10.6.6
 
 const CL_OPERATIONAL_CREDENTIALS: u32 = 0x003E;
 const CMD_ATTESTATION_REQUEST: u32 = 0x00; // §11.18.6.1
 const CMD_CSR_REQUEST: u32 = 0x04; // §11.18.6.5
+const CMD_CSR_RESPONSE: u32 = 0x05; // §11.18.6.6
 const CMD_ADD_NOC: u32 = 0x06; // §11.18.6.8
+const CMD_NOC_RESPONSE: u32 = 0x08; // §11.18.6.10
 const CMD_ADD_TRUSTED_ROOT_CERTIFICATE: u32 = 0x0B; // §11.18.6.13
 
 const CL_NETWORK_COMMISSIONING: u32 = 0x0031;
@@ -659,9 +662,10 @@ pub async fn arm_fail_safe(
             if let Some(resp) = chunk.response().map_err(ControllerError::from)? {
                 for (_endpoint, r) in resp.responses::<ArmFailSafeResponse>(
                     CL_GENERAL_COMMISSIONING,
-                    // The response cluster command id matches the request's
-                    // — ArmFailSafe(0x00) → ArmFailSafeResponse(0x00).
-                    CMD_ARM_FAIL_SAFE,
+                    // InvokeResponseIB carries the *response* command ID,
+                    // not the request — ArmFailSafe(0x00) →
+                    // ArmFailSafeResponse(0x01).
+                    CMD_ARM_FAIL_SAFE_RESPONSE,
                 ) {
                     match r {
                         Ok(afs) => {
@@ -769,7 +773,7 @@ pub async fn csr_request(
         if payload.is_none() {
             if let Some(resp) = chunk.response().map_err(ControllerError::from)? {
                 for (_endpoint, result) in
-                    resp.responses::<CSRResponse>(CL_OPERATIONAL_CREDENTIALS, CMD_CSR_REQUEST)
+                    resp.responses::<CSRResponse>(CL_OPERATIONAL_CREDENTIALS, CMD_CSR_RESPONSE)
                 {
                     match result {
                         Ok(csr_resp) => {
@@ -890,7 +894,7 @@ pub async fn add_noc(
         if result.is_none() {
             if let Some(resp) = chunk.response().map_err(ControllerError::from)? {
                 for (_endpoint, r) in
-                    resp.responses::<NOCResponse>(CL_OPERATIONAL_CREDENTIALS, CMD_ADD_NOC)
+                    resp.responses::<NOCResponse>(CL_OPERATIONAL_CREDENTIALS, CMD_NOC_RESPONSE)
                 {
                     match r {
                         Ok(noc_resp) => {
