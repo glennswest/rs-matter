@@ -97,12 +97,19 @@ fn run() -> Result<(), Error> {
         core::mem::size_of::<Subscriptions>()
     );
 
+    // Allow port override via env var — useful for co-locating onoff_light
+    // with another Matter stack (e.g. a zman controller) on the same host.
+    let port: u16 = std::env::var("MATTER_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(MATTER_PORT);
+
     let matter = MATTER.uninit().init_with(Matter::init(
         &TEST_DEV_DET,
         TEST_DEV_COMM,
         &TEST_DEV_ATT,
         rs_matter::utils::epoch::sys_epoch,
-        MATTER_PORT,
+        port,
     ));
 
     // Persistence

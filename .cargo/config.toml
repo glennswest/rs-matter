@@ -1,2 +1,6 @@
-[alias]
-xtask = "run --quiet --manifest-path xtask/Cargo.toml --"
+# Cross-compile to ARM64 Linux musl (Raspberry Pi etc.) using the
+# Homebrew aarch64-unknown-linux-musl-gcc toolchain.
+[target.aarch64-unknown-linux-musl]
+linker = "aarch64-unknown-linux-musl-gcc"
+ar = "aarch64-unknown-linux-musl-ar"
+rustflags = ["-C", "link-self-contained=yes", "-C", "target-feature=+crt-static"]
