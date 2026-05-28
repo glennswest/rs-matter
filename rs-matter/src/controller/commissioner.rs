@@ -157,6 +157,15 @@ pub async fn arm_fail_safe(
             None => break,
         }
     }
+    // ArmFailSafe is NOT a DefaultSuccess command — a successful arm is
+    // signalled by an ArmFailSafeResponse with ErrorCode=OK. If no such
+    // response was decoded (device returned a StatusResponse, an unexpected
+    // command id, or nothing), do not report success: the fail-safe is not
+    // armed and the subsequent commissioning invokes would fail with a
+    // confusing downstream error instead of the real cause here.
+    if !got_response {
+        return Err(ControllerError::FailSafeExpired);
+    }
     Ok(())
 }
 
@@ -593,8 +602,8 @@ pub fn decode_nocsr_elements(blob: &[u8]) -> Result<DecodedNocsr<'_>, Controller
 pub struct PaseCommissionResult {
     pub fabric_index: u8,
     pub device_node_id: u64,
-    pub noc_der: heapless::Vec<u8, 400>,
-    pub icac_der: heapless::Vec<u8, 400>,
+    pub noc_der: heapless::Vec<u8, { crate::cert::MAX_CERT_TLV_LEN }>,
+    pub icac_der: heapless::Vec<u8, { crate::cert::MAX_CERT_TLV_LEN }>,
 }
 
 pub async fn commission_pase<C: Crypto>(
@@ -655,13 +664,13 @@ pub async fn commission_pase<C: Crypto>(
     // 7. CommissioningComplete.
     commissioning_complete(matter).await?;
 
-    let mut noc_out: heapless::Vec<u8, 400> = heapless::Vec::new();
+    let mut noc_out: heapless::Vec<u8, { crate::cert::MAX_CERT_TLV_LEN }> = heapless::Vec::new();
     noc_out.extend_from_slice(&device_creds.noc).map_err(|_| {
         ControllerError::Inner(crate::error::Error::new(
             crate::error::ErrorCode::BufferTooSmall,
         ))
     })?;
-    let mut icac_out: heapless::Vec<u8, 400> = heapless::Vec::new();
+    let mut icac_out: heapless::Vec<u8, { crate::cert::MAX_CERT_TLV_LEN }> = heapless::Vec::new();
     if let Some(icac) = device_creds.icac.as_ref() {
         icac_out.extend_from_slice(icac).map_err(|_| {
             ControllerError::Inner(crate::error::Error::new(
