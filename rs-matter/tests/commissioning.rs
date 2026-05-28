@@ -358,10 +358,7 @@ async fn discover_device<const A: usize>(
         .map_err(|_| Error::from(rs_matter::error::ErrorCode::Failure))??;
 
     devices.into_iter().next().ok_or_else(|| {
-        warn!(
-            "No devices found matching discriminator {:?}",
-            filter.discriminator
-        );
+        warn!("No devices found matching filter {:?}", filter);
         rs_matter::error::ErrorCode::NotFound.into()
     })
 }
@@ -421,10 +418,7 @@ async fn discover_device<const A: usize>(
     .await?;
 
     devices.into_iter().next().ok_or_else(|| {
-        warn!(
-            "No devices found matching discriminator {:#?}",
-            filter.discriminator
-        );
+        warn!("No devices found matching filter {:#?}", filter);
         rs_matter::error::ErrorCode::NotFound.into()
     })
 }
